@@ -288,6 +288,48 @@ func (h *StockHandler) GetStockByLocal(c *gin.Context) {
 	})
 }
 
+// GetStockCompleteByLocal obtiene stock con información completa del producto, categoría y local
+func (h *StockHandler) GetStockCompleteByLocal(c *gin.Context) {
+	start := time.Now()
+
+	// Obtener ID del local desde la URL
+	idLocalStr := c.Param("id")
+	idLocal, err := strconv.Atoi(idLocalStr)
+	if err != nil {
+		h.logError("ID de local inválido", zap.String("id", idLocalStr), zap.Error(err))
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "❌ ID de local inválido",
+			"error":   "El ID debe ser un número entero",
+		})
+		return
+	}
+
+	h.logInfo("Consultando stock completo por local",
+		zap.Int("id_local", idLocal))
+
+	// Obtener stock con información completa
+	stocks, err := h.stockService.GetStockCompleteByLocal(c.Request.Context(), idLocal)
+	if err != nil {
+		h.logError("Error obteniendo stock completo", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "❌ Error obteniendo stock completo",
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	h.logSuccess("Stock completo obtenido exitosamente",
+		zap.Int("cantidad_productos", len(stocks)),
+		zap.Duration("duracion", time.Since(start)))
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    stocks,
+	})
+}
+
 // GetStockBajo obtiene productos con stock bajo
 func (h *StockHandler) GetStockBajo(c *gin.Context) {
 	logger := h.logger.With(zap.String("handler", "get_stock_bajo"))

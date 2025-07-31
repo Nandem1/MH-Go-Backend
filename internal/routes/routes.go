@@ -21,6 +21,7 @@ func SetupRoutes(router *gin.Engine, stockHandler *handlers.StockHandler, posHan
 
 			// Consultas
 			stock.GET("/local/:id", stockHandler.GetStockByLocal)
+			stock.GET("/local-completo/:id", stockHandler.GetStockCompleteByLocal)
 			stock.GET("/bajo/:id", stockHandler.GetStockBajo)
 			stock.GET("/bajo-stock/:id", stockHandler.GetStockBajo) // Alias para compatibilidad
 			stock.GET("/producto/:codigo", stockHandler.GetStockByProducto)

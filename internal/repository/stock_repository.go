@@ -17,6 +17,9 @@ type StockRepository interface {
 	GetStockByLocal(ctx context.Context, idLocal int) ([]*models.Stock, error)
 	GetStockBajo(ctx context.Context, idLocal int) ([]*models.Stock, error)
 
+	// Nueva operación con JOINs completos
+	GetStockCompleteByLocal(ctx context.Context, idLocal int) ([]*models.StockComplete, error)
+
 	// Operaciones de movimientos
 	CreateMovimiento(ctx context.Context, movimiento *models.Movimiento) error
 	GetMovimientosByLocal(ctx context.Context, filter *models.MovimientoFilter) ([]*models.Movimiento, error)
@@ -83,6 +86,22 @@ func (r *stockRepository) prepareStatements() error {
 			FROM stock_bodega_cantera 
 			WHERE id_local = $1 AND cantidad_actual <= cantidad_minima
 			ORDER BY cantidad_actual ASC
+		`,
+		"get_stock_complete_by_local": `
+			SELECT 
+				s.id, s.codigo_producto, s.tipo_item, s.cantidad_actual, s.cantidad_minima, 
+				s.id_local, s.created_at, s.updated_at,
+				p.nombre as nombre_producto, p.codigo_barra_interno, p.codigo_barra_externo,
+				p.descripcion, p.precio, p.unidad, p.id_categoria, p.es_servicio, p.es_exento,
+				p.impuesto_especifico, p.disponible_para_venta, p.activo, p.utilidad, p.tipo_utilidad,
+				c.nombre as nombre_categoria,
+				l.nombre_local as nombre_local
+			FROM stock_bodega_cantera s
+			LEFT JOIN productos p ON s.codigo_producto = p.codigo
+			LEFT JOIN categorias c ON p.id_categoria = c.id
+			LEFT JOIN locales l ON s.id_local = l.id
+			WHERE s.id_local = $1
+			ORDER BY s.codigo_producto
 		`,
 		"create_movimiento": `
 			INSERT INTO stock_movimientos_cantera 
@@ -217,6 +236,36 @@ func (r *stockRepository) GetStockBajo(ctx context.Context, idLocal int) ([]*mod
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan stock: %w", err)
+		}
+		stocks = append(stocks, &stock)
+	}
+
+	return stocks, nil
+}
+
+// GetStockCompleteByLocal obtiene stock con información completa del producto, categoría y local
+func (r *stockRepository) GetStockCompleteByLocal(ctx context.Context, idLocal int) ([]*models.StockComplete, error) {
+	rows, err := r.stmts["get_stock_complete_by_local"].QueryContext(ctx, idLocal)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stock complete by local: %w", err)
+	}
+	defer rows.Close()
+
+	var stocks []*models.StockComplete
+	for rows.Next() {
+		var stock models.StockComplete
+		err := rows.Scan(
+			&stock.ID, &stock.CodigoProducto, &stock.TipoItem, &stock.CantidadActual,
+			&stock.CantidadMinima, &stock.IDLocal, &stock.CreatedAt, &stock.UpdatedAt,
+			&stock.NombreProducto, &stock.CodigoBarraInterno, &stock.CodigoBarraExterno,
+			&stock.Descripcion, &stock.Precio, &stock.Unidad, &stock.IDCategoria,
+			&stock.EsServicio, &stock.EsExento, &stock.ImpuestoEspecifico,
+			&stock.DisponibleVenta, &stock.Activo, &stock.Utilidad, &stock.TipoUtilidad,
+			&stock.NombreCategoria,
+			&stock.NombreLocal,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan stock complete: %w", err)
 		}
 		stocks = append(stocks, &stock)
 	}

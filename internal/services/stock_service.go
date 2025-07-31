@@ -26,6 +26,7 @@ type StockService interface {
 	GetStockByLocal(ctx context.Context, idLocal int) ([]*models.Stock, error)
 	GetStockBajo(ctx context.Context, idLocal int) ([]*models.Stock, error)
 	GetStockByProducto(ctx context.Context, codigoProducto string, idLocal int) (*models.Stock, error)
+	GetStockCompleteByLocal(ctx context.Context, idLocal int) ([]*models.StockComplete, error)
 	GetMovimientosByLocal(ctx context.Context, filter *models.MovimientoFilter) ([]*models.Movimiento, error)
 
 	// POS - Búsqueda de productos
@@ -318,6 +319,11 @@ func (s *stockService) GetStockByLocal(ctx context.Context, idLocal int) ([]*mod
 // GetStockBajo obtiene productos con stock bajo
 func (s *stockService) GetStockBajo(ctx context.Context, idLocal int) ([]*models.Stock, error) {
 	return s.repo.GetStockBajo(ctx, idLocal)
+}
+
+// GetStockCompleteByLocal obtiene stock con información completa del producto, categoría y local
+func (s *stockService) GetStockCompleteByLocal(ctx context.Context, idLocal int) ([]*models.StockComplete, error) {
+	return s.repo.GetStockCompleteByLocal(ctx, idLocal)
 }
 
 // GetMovimientosByLocal obtiene movimientos de un local
