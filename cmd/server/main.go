@@ -96,7 +96,7 @@ func main() {
 
 	// Crear handlers
 	stockHandler := handlers.NewStockHandler(stockService, logger)
-	posHandler := handlers.NewPOSHandler(productCache, stockService, logger)
+	posHandler := handlers.NewPOSHandler(productCache, stockService, productRepo, logger)
 	monitoringHandler := handlers.NewMonitoringHandler(monitoringService, logger)
 
 	// Crear health checker

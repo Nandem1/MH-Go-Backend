@@ -42,6 +42,16 @@ func SetupRoutes(router *gin.Engine, stockHandler *handlers.StockHandler, posHan
 			pos.POST("/venta-rapida", posHandler.QuickSale)
 			pos.POST("/preload", posHandler.PreloadFrequentProducts)
 			pos.GET("/cache-stats", posHandler.GetCacheStats)
+			
+			// Endpoints para invalidar cache
+			pos.DELETE("/cache/producto/:codigo", posHandler.InvalidateProductCache)
+			pos.DELETE("/cache/codigo-tivendo/:codigo", posHandler.InvalidateByCodigoTivendo)
+			pos.DELETE("/cache/all", posHandler.InvalidateAllCache)
+			pos.POST("/cache/invalidate", posHandler.InvalidateProductsCache)
+			
+			// Endpoint para notificar actualización masiva de lista_precios_cantera
+			// Llamar desde el otro servidor después de actualizar ~9900 filas
+			pos.POST("/cache/notify-lista-precios-update", posHandler.NotifyListaPreciosUpdate)
 		}
 
 		// Monitoring routes

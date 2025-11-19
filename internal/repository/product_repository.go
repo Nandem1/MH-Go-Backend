@@ -16,6 +16,7 @@ type ProductRepository interface {
 	GetProductoByBarcode(ctx context.Context, barcode string) (*models.ProductoCompleto, error)
 	GetProductosFrecuentes(ctx context.Context, limit int) ([]*models.ProductoCompleto, error)
 	UpdateProducto(ctx context.Context, producto *models.ProductoCompleto) error
+	GetLastListaPreciosTimestamp(ctx context.Context) (*time.Time, error)
 }
 
 // productRepository implementación del repository
@@ -204,11 +205,19 @@ func (r *productRepository) prepareStatements() error {
 		LIMIT $1;
 	`
 
+	// Query para obtener el último timestamp de lista_precios_cantera (ultra-rápido)
+	queryLastTimestamp := `
+		SELECT MAX(updated_at) 
+		FROM lista_precios_cantera
+		WHERE updated_at IS NOT NULL;
+	`
+
 	// Preparar statements
 	statements := map[string]string{
-		"get_producto_by_barcode":  queryProducto,
-		"get_pack_by_barcode":      queryPack,
-		"get_productos_frecuentes": queryFrecuentes,
+		"get_producto_by_barcode":      queryProducto,
+		"get_pack_by_barcode":           queryPack,
+		"get_productos_frecuentes":     queryFrecuentes,
+		"get_last_lista_precios_timestamp": queryLastTimestamp,
 	}
 
 	for name, query := range statements {
@@ -280,6 +289,25 @@ func (r *productRepository) GetProductosFrecuentes(ctx context.Context, limit in
 func (r *productRepository) UpdateProducto(ctx context.Context, producto *models.ProductoCompleto) error {
 	// TODO: Implementar actualización de producto
 	return fmt.Errorf("not implemented yet")
+}
+
+// GetLastListaPreciosTimestamp obtiene el último timestamp de actualización de lista_precios_cantera
+// Esta query es ultra-rápida (solo MAX de un índice)
+func (r *productRepository) GetLastListaPreciosTimestamp(ctx context.Context) (*time.Time, error) {
+	var timestamp sql.NullTime
+	err := r.stmts["get_last_lista_precios_timestamp"].QueryRowContext(ctx).Scan(&timestamp)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get last lista precios timestamp: %w", err)
+	}
+
+	if !timestamp.Valid {
+		return nil, nil
+	}
+
+	return &timestamp.Time, nil
 }
 
 // scanProductoCompleto escanea una fila de la base de datos

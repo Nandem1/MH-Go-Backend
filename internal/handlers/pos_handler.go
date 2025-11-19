@@ -7,6 +7,7 @@ import (
 
 	"stock-service/internal/cache"
 	"stock-service/internal/models"
+	"stock-service/internal/repository"
 	"stock-service/internal/services"
 
 	"github.com/gin-gonic/gin"
@@ -17,14 +18,16 @@ import (
 type POSHandler struct {
 	productCache *cache.ProductCache
 	stockService services.StockService
+	productRepo  repository.ProductRepository
 	logger       *zap.Logger
 }
 
 // NewPOSHandler crea una nueva instancia del handler POS
-func NewPOSHandler(productCache *cache.ProductCache, stockService services.StockService, logger *zap.Logger) *POSHandler {
+func NewPOSHandler(productCache *cache.ProductCache, stockService services.StockService, productRepo repository.ProductRepository, logger *zap.Logger) *POSHandler {
 	return &POSHandler{
 		productCache: productCache,
 		stockService: stockService,
+		productRepo:  productRepo,
 		logger:       logger,
 	}
 }
@@ -49,6 +52,13 @@ func (h *POSHandler) SearchProductByBarcode(c *gin.Context) {
 	)
 
 	logger.Info("Buscando producto por código de barras")
+
+	// 0. Validar versión global de lista_precios (solo consulta a Redis, ultra-rápida)
+	// Solo consulta PostgreSQL si detecta que la versión puede haber cambiado
+	if err := h.validateGlobalVersion(c.Request.Context()); err != nil {
+		logger.Warn("Error validando versión global, continuando con cache",
+			zap.Error(err))
+	}
 
 	// 1. Buscar en caché multi-nivel (ultra-rápido)
 	producto, err := h.productCache.GetProduct(c.Request.Context(), codigoBarras)
@@ -292,4 +302,284 @@ func (h *POSHandler) GetCacheStats(c *gin.Context) {
 		"message": "✅ Estadísticas del caché",
 		"data":    stats,
 	})
+}
+
+// InvalidateProductCache invalida la cache de un producto por código de barras
+func (h *POSHandler) InvalidateProductCache(c *gin.Context) {
+	codigoBarras := c.Param("codigo")
+
+	if codigoBarras == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "❌ Código de barras requerido",
+			"error":   "El código de barras no puede estar vacío",
+		})
+		return
+	}
+
+	logger := h.logger.With(
+		zap.String("handler", "invalidate_product_cache"),
+		zap.String("codigo_barras", codigoBarras),
+	)
+
+	logger.Info("Invalidando cache de producto")
+
+	if err := h.productCache.InvalidateProduct(c.Request.Context(), codigoBarras); err != nil {
+		logger.Error("Error invalidando cache", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "❌ Error invalidando cache",
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "✅ Cache invalidada correctamente",
+		"data": gin.H{
+			"codigo_barras": codigoBarras,
+		},
+	})
+}
+
+// InvalidateByCodigoTivendo invalida la cache de productos por código_tivendo
+// Útil cuando se actualiza la tabla lista_precios_cantera
+func (h *POSHandler) InvalidateByCodigoTivendo(c *gin.Context) {
+	codigoTivendo := c.Param("codigo")
+
+	if codigoTivendo == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "❌ Código Tivendo requerido",
+			"error":   "El código Tivendo no puede estar vacío",
+		})
+		return
+	}
+
+	logger := h.logger.With(
+		zap.String("handler", "invalidate_by_codigo_tivendo"),
+		zap.String("codigo_tivendo", codigoTivendo),
+	)
+
+	logger.Info("Invalidando cache por código Tivendo")
+
+	if err := h.productCache.InvalidateByCodigoTivendo(c.Request.Context(), codigoTivendo); err != nil {
+		logger.Error("Error invalidando cache", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "❌ Error invalidando cache",
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "✅ Cache invalidada correctamente",
+		"data": gin.H{
+			"codigo_tivendo": codigoTivendo,
+		},
+	})
+}
+
+// InvalidateAllCache invalida toda la cache de productos
+// Útil cuando se actualiza masivamente la tabla lista_precios_cantera
+func (h *POSHandler) InvalidateAllCache(c *gin.Context) {
+	logger := h.logger.With(
+		zap.String("handler", "invalidate_all_cache"),
+	)
+
+	logger.Info("Invalidando toda la cache de productos")
+
+	if err := h.productCache.InvalidateAll(c.Request.Context()); err != nil {
+		logger.Error("Error invalidando cache", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "❌ Error invalidando cache",
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	stats := h.productCache.GetStats()
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "✅ Cache invalidada completamente",
+		"data": gin.H{
+			"cache_stats": stats,
+		},
+	})
+}
+
+// InvalidateProductsCache invalida múltiples productos por códigos de barras
+func (h *POSHandler) InvalidateProductsCache(c *gin.Context) {
+	var req struct {
+		CodigosBarras []string `json:"codigos_barras" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "❌ Error en el formato de datos",
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	logger := h.logger.With(
+		zap.String("handler", "invalidate_products_cache"),
+		zap.Int("cantidad", len(req.CodigosBarras)),
+	)
+
+	logger.Info("Invalidando cache de múltiples productos")
+
+	if err := h.productCache.InvalidateProducts(c.Request.Context(), req.CodigosBarras); err != nil {
+		logger.Error("Error invalidando cache", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "❌ Error invalidando cache",
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "✅ Cache invalidada correctamente",
+		"data": gin.H{
+			"codigos_invalidados": len(req.CodigosBarras),
+		},
+	})
+}
+
+// NotifyListaPreciosUpdate notifica que se actualizó lista_precios_cantera masivamente
+// Este endpoint debe ser llamado desde el otro servidor después de actualizar ~9900 filas
+func (h *POSHandler) NotifyListaPreciosUpdate(c *gin.Context) {
+	logger := h.logger.With(
+		zap.String("handler", "notify_lista_precios_update"),
+	)
+
+	logger.Info("Notificación de actualización masiva de lista_precios_cantera")
+
+	// Obtener el último timestamp de la BD
+	timestamp, err := h.productRepo.GetLastListaPreciosTimestamp(c.Request.Context())
+	if err != nil {
+		logger.Error("Error obteniendo timestamp de lista_precios", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "❌ Error obteniendo timestamp",
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	if timestamp == nil {
+		logger.Warn("No se encontró timestamp de lista_precios")
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "⚠️ No hay timestamp disponible",
+		})
+		return
+	}
+
+	// Convertir timestamp a string para usar como versión
+	version := timestamp.Format(time.RFC3339Nano)
+
+	// Invalidar cache si la versión cambió
+	invalidated, err := h.productCache.InvalidateAllByVersion(c.Request.Context(), version)
+	if err != nil {
+		logger.Error("Error invalidando cache por versión", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "❌ Error invalidando cache",
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	if invalidated {
+		logger.Info("Cache invalidada por actualización masiva",
+			zap.String("version", version))
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "✅ Cache invalidada correctamente",
+			"data": gin.H{
+				"version":     version,
+				"invalidated": true,
+			},
+		})
+	} else {
+		logger.Info("Cache ya estaba actualizada",
+			zap.String("version", version))
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "✅ Cache ya está actualizada",
+			"data": gin.H{
+				"version":     version,
+				"invalidated": false,
+			},
+		})
+	}
+}
+
+// validateGlobalVersion valida la versión global de lista_precios_cantera
+// Optimizado: primero consulta Redis (ultra-rápido), solo consulta BD si es necesario
+func (h *POSHandler) validateGlobalVersion(ctx context.Context) error {
+	// 1. Primero obtener versión actual de Redis (ultra-rápido, ~0.1ms)
+	currentVersion, err := h.productCache.GetGlobalVersion(ctx)
+	if err != nil {
+		// Si hay error con Redis, no bloquear, continuar con cache
+		return err
+	}
+
+	// 2. Si no hay versión en Redis, obtener de BD y guardar (solo primera vez)
+	if currentVersion == "" {
+		timestamp, err := h.productRepo.GetLastListaPreciosTimestamp(ctx)
+		if err != nil {
+			return err
+		}
+		if timestamp != nil {
+			version := timestamp.Format(time.RFC3339Nano)
+			return h.productCache.SetGlobalVersion(ctx, version)
+		}
+		return nil
+	}
+
+	// 3. Si hay versión en Redis, verificar BD solo si pasó el intervalo
+	// Esto evita sobrecargar PostgreSQL con consultas en cada request
+	shouldCheck, err := h.productCache.ShouldCheckDatabase(ctx)
+	if err != nil {
+		// Error verificando, continuar sin bloquear
+		return err
+	}
+
+	if !shouldCheck {
+		// Aún no es tiempo de verificar, solo usar Redis (ultra-rápido)
+		return nil
+	}
+
+	// Es tiempo de verificar BD (solo cada 10 segundos aproximadamente)
+	timestamp, err := h.productRepo.GetLastListaPreciosTimestamp(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Actualizar timestamp de última verificación
+	h.productCache.UpdateLastCheck(ctx)
+
+	if timestamp == nil {
+		return nil
+	}
+
+	newVersion := timestamp.Format(time.RFC3339Nano)
+
+	// Solo invalidar si la versión cambió
+	if currentVersion != newVersion {
+		_, err = h.productCache.InvalidateAllByVersion(ctx, newVersion)
+		return err
+	}
+
+	return nil
 }

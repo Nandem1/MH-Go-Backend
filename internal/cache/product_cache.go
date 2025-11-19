@@ -40,16 +40,24 @@ type ProductCache struct {
 	statsMutex sync.RWMutex
 	hits       int64
 	misses     int64
+
+	// Versión global de lista_precios_cantera (para invalidación masiva)
+	globalVersionKey        string
+	lastCheckTimestampKey   string
+	checkIntervalSeconds    int64 // Verificar BD solo cada N segundos
 }
 
 // NewProductCache crea una nueva instancia del caché
 func NewProductCache(redisClient *redis.Client, maxL1Size int, ttl time.Duration, logger *zap.Logger) *ProductCache {
 	pc := &ProductCache{
-		l1Cache:     make(map[string]*models.ProductoCompleto),
-		redisClient: redisClient,
-		maxL1Size:   maxL1Size,
-		ttl:         ttl,
-		logger:      logger,
+		l1Cache:               make(map[string]*models.ProductoCompleto),
+		redisClient:           redisClient,
+		maxL1Size:             maxL1Size,
+		ttl:                   ttl,
+		logger:                logger,
+		globalVersionKey:      "lista_precios:global_version",
+		lastCheckTimestampKey: "lista_precios:last_check",
+		checkIntervalSeconds:  10, // Verificar BD solo cada 10 segundos
 	}
 
 	// Iniciar limpieza periódica del L1 cache
@@ -76,6 +84,8 @@ func (pc *ProductCache) GetStats() CacheStats {
 }
 
 // GetProduct busca un producto con caché multi-nivel
+// Implementa stale-while-revalidate: devuelve cache aunque esté desactualizado,
+// pero valida en background si necesita actualizarse
 func (pc *ProductCache) GetProduct(ctx context.Context, codigoBarras string) (*models.ProductoCompleto, error) {
 	start := time.Now()
 
@@ -106,6 +116,87 @@ func (pc *ProductCache) GetProduct(ctx context.Context, codigoBarras string) (*m
 		zap.Duration("latency", time.Since(start)))
 
 	return nil, fmt.Errorf("producto no encontrado en caché")
+}
+
+// GetGlobalVersion obtiene la versión global de lista_precios_cantera desde Redis
+func (pc *ProductCache) GetGlobalVersion(ctx context.Context) (string, error) {
+	version, err := pc.redisClient.Get(ctx, pc.globalVersionKey).Result()
+	if err == redis.Nil {
+		return "", nil // No hay versión guardada aún
+	}
+	if err != nil {
+		return "", err
+	}
+	return version, nil
+}
+
+// SetGlobalVersion actualiza la versión global de lista_precios_cantera en Redis
+func (pc *ProductCache) SetGlobalVersion(ctx context.Context, version string) error {
+	now := time.Now().Unix()
+	// Guardar versión y timestamp de última verificación
+	pipe := pc.redisClient.Pipeline()
+	pipe.Set(ctx, pc.globalVersionKey, version, 0)
+	pipe.Set(ctx, pc.lastCheckTimestampKey, now, 0)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// ShouldCheckDatabase verifica si debemos consultar la BD basado en el intervalo
+func (pc *ProductCache) ShouldCheckDatabase(ctx context.Context) (bool, error) {
+	lastCheckStr, err := pc.redisClient.Get(ctx, pc.lastCheckTimestampKey).Result()
+	if err == redis.Nil {
+		// Nunca se ha verificado, sí debemos verificar
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	var lastCheck int64
+	if _, err := fmt.Sscanf(lastCheckStr, "%d", &lastCheck); err != nil {
+		// Error parseando, verificar de nuevo
+		return true, nil
+	}
+
+	now := time.Now().Unix()
+	elapsed := now - lastCheck
+
+	// Solo verificar si pasó el intervalo
+	return elapsed >= pc.checkIntervalSeconds, nil
+}
+
+// UpdateLastCheck actualiza el timestamp de última verificación
+func (pc *ProductCache) UpdateLastCheck(ctx context.Context) error {
+	now := time.Now().Unix()
+	return pc.redisClient.Set(ctx, pc.lastCheckTimestampKey, now, 0).Err()
+}
+
+// InvalidateAllByVersion invalida toda la cache si la versión cambió
+func (pc *ProductCache) InvalidateAllByVersion(ctx context.Context, newVersion string) (bool, error) {
+	currentVersion, err := pc.GetGlobalVersion(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	// Si la versión cambió, invalidar todo
+	if currentVersion != newVersion {
+		pc.logger.Info("Versión global de lista_precios cambió, invalidando cache",
+			zap.String("version_anterior", currentVersion),
+			zap.String("version_nueva", newVersion))
+
+		if err := pc.InvalidateAll(ctx); err != nil {
+			return false, err
+		}
+
+		// Actualizar la versión
+		if err := pc.SetGlobalVersion(ctx, newVersion); err != nil {
+			return false, err
+		}
+
+		return true, nil
+	}
+
+	return false, nil
 }
 
 // recordHit registra un hit en el caché
@@ -140,6 +231,128 @@ func (pc *ProductCache) InvalidateProduct(ctx context.Context, codigoBarras stri
 
 	// 2. L2 Cache
 	return pc.redisClient.Del(ctx, fmt.Sprintf("product:%s", codigoBarras)).Err()
+}
+
+// InvalidateProducts invalida múltiples productos por códigos de barras
+func (pc *ProductCache) InvalidateProducts(ctx context.Context, codigosBarras []string) error {
+	if len(codigosBarras) == 0 {
+		return nil
+	}
+
+	// 1. L1 Cache - Invalidar en memoria
+	pc.l1Mutex.Lock()
+	for _, codigo := range codigosBarras {
+		delete(pc.l1Cache, codigo)
+	}
+	pc.l1Mutex.Unlock()
+
+	// 2. L2 Cache - Invalidar en Redis (usar pipeline para mejor rendimiento)
+	pipe := pc.redisClient.Pipeline()
+	for _, codigo := range codigosBarras {
+		pipe.Del(ctx, fmt.Sprintf("product:%s", codigo))
+	}
+	_, err := pipe.Exec(ctx)
+	if err != nil && err != redis.Nil {
+		pc.logger.Error("Error invalidando productos en Redis",
+			zap.Int("cantidad", len(codigosBarras)),
+			zap.Error(err))
+		return err
+	}
+
+	pc.logger.Info("Productos invalidados en cache",
+		zap.Int("cantidad", len(codigosBarras)))
+
+	return nil
+}
+
+// InvalidateByCodigoTivendo invalida todos los productos que tienen un código_tivendo específico
+// Busca en L1 y L2 cache todos los productos que coincidan con el código_tivendo
+func (pc *ProductCache) InvalidateByCodigoTivendo(ctx context.Context, codigoTivendo string) error {
+	var codigosInvalidar []string
+
+	// 1. Buscar en L1 Cache
+	pc.l1Mutex.RLock()
+	for codigoBarras, producto := range pc.l1Cache {
+		if producto != nil && producto.Codigo == codigoTivendo {
+			codigosInvalidar = append(codigosInvalidar, codigoBarras)
+		}
+		// También verificar si es un pack con el código
+		if producto != nil && producto.CodigoPack != nil && *producto.CodigoPack == codigoTivendo {
+			codigosInvalidar = append(codigosInvalidar, codigoBarras)
+		}
+	}
+	pc.l1Mutex.RUnlock()
+
+	// 2. Buscar en L2 Cache (Redis) - buscar por patrón
+	pattern := fmt.Sprintf("product:*")
+	iter := pc.redisClient.Scan(ctx, 0, pattern, 0).Iterator()
+	for iter.Next(ctx) {
+		key := iter.Val()
+		codigoBarras := key[8:] // Remover "product:" del inicio
+
+		// Obtener el producto del cache para verificar su código
+		producto, err := pc.getFromL2(ctx, codigoBarras)
+		if err == nil && producto != nil {
+			if producto.Codigo == codigoTivendo {
+				codigosInvalidar = append(codigosInvalidar, codigoBarras)
+			}
+			if producto.CodigoPack != nil && *producto.CodigoPack == codigoTivendo {
+				codigosInvalidar = append(codigosInvalidar, codigoBarras)
+			}
+		}
+	}
+	if err := iter.Err(); err != nil {
+		pc.logger.Error("Error escaneando Redis para invalidación",
+			zap.String("codigo_tivendo", codigoTivendo),
+			zap.Error(err))
+	}
+
+	// 3. Invalidar todos los productos encontrados
+	if len(codigosInvalidar) > 0 {
+		pc.logger.Info("Invalidando productos por código_tivendo",
+			zap.String("codigo_tivendo", codigoTivendo),
+			zap.Int("productos_encontrados", len(codigosInvalidar)))
+		return pc.InvalidateProducts(ctx, codigosInvalidar)
+	}
+
+	pc.logger.Debug("No se encontraron productos en cache para código_tivendo",
+		zap.String("codigo_tivendo", codigoTivendo))
+
+	return nil
+}
+
+// InvalidateAll invalida toda la cache de productos (útil cuando se actualiza lista_precios_cantera masivamente)
+func (pc *ProductCache) InvalidateAll(ctx context.Context) error {
+	// 1. L1 Cache - Limpiar todo
+	pc.l1Mutex.Lock()
+	cantidadL1 := len(pc.l1Cache)
+	pc.l1Cache = make(map[string]*models.ProductoCompleto)
+	pc.l1Mutex.Unlock()
+
+	// 2. L2 Cache - Eliminar todas las claves de productos
+	pattern := "product:*"
+	iter := pc.redisClient.Scan(ctx, 0, pattern, 0).Iterator()
+	var keys []string
+	for iter.Next(ctx) {
+		keys = append(keys, iter.Val())
+	}
+	if err := iter.Err(); err != nil {
+		pc.logger.Error("Error escaneando Redis para invalidación total", zap.Error(err))
+		return err
+	}
+
+	if len(keys) > 0 {
+		if err := pc.redisClient.Del(ctx, keys...).Err(); err != nil {
+			pc.logger.Error("Error eliminando claves de Redis", zap.Error(err))
+			return err
+		}
+	}
+
+	pc.logger.Info("Cache de productos invalidada completamente",
+		zap.Int("productos_l1", cantidadL1),
+		zap.Int("productos_l2", len(keys)))
+
+	return nil
 }
 
 // PreloadProducts pre-carga productos frecuentes
