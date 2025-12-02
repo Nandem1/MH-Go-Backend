@@ -54,10 +54,14 @@ func (h *POSHandler) SearchProductByBarcode(c *gin.Context) {
 
 	logger.Info("Buscando producto por código de barras")
 
-	// 0. Validar versión global de lista_precios (solo consulta a Redis, ultra-rápida)
+	// 0. Validar versiones globales (solo consulta a Redis, ultra-rápida)
 	// Solo consulta PostgreSQL si detecta que la versión puede haber cambiado
 	if err := h.validateGlobalVersion(c.Request.Context()); err != nil {
-		logger.Warn("Error validando versión global, continuando con cache",
+		logger.Warn("Error validando versión global de lista_precios, continuando con cache",
+			zap.Error(err))
+	}
+	if err := h.validateProductosVersion(c.Request.Context()); err != nil {
+		logger.Warn("Error validando versión global de productos, continuando con cache",
 			zap.Error(err))
 	}
 
@@ -455,6 +459,76 @@ func (h *POSHandler) InvalidateProductsCache(c *gin.Context) {
 	})
 }
 
+// NotifyProductosUpdate notifica que se actualizaron productos/packs masivamente
+// Este endpoint debe ser llamado desde el otro servidor después de actualizar productos
+func (h *POSHandler) NotifyProductosUpdate(c *gin.Context) {
+	logger := h.logger.With(
+		zap.String("handler", "notify_productos_update"),
+	)
+
+	logger.Info("Notificación de actualización masiva de productos/packs")
+
+	// Obtener el último timestamp de la BD
+	timestamp, err := h.productRepo.GetLastProductosTimestamp(c.Request.Context())
+	if err != nil {
+		logger.Error("Error obteniendo timestamp de productos", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "❌ Error obteniendo timestamp",
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	if timestamp == nil {
+		logger.Warn("No se encontró timestamp de productos")
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "⚠️ No hay timestamp disponible",
+		})
+		return
+	}
+
+	// Convertir timestamp a string para usar como versión
+	version := timestamp.Format(time.RFC3339Nano)
+
+	// Invalidar cache si la versión cambió
+	invalidated, err := h.productCache.InvalidateAllByProductosVersion(c.Request.Context(), version)
+	if err != nil {
+		logger.Error("Error invalidando cache por versión", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "❌ Error invalidando cache",
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	if invalidated {
+		logger.Info("Cache invalidada por actualización masiva de productos",
+			zap.String("version", version))
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "✅ Cache invalidada correctamente",
+			"data": gin.H{
+				"version":     version,
+				"invalidated": true,
+			},
+		})
+	} else {
+		logger.Info("Cache ya estaba actualizada",
+			zap.String("version", version))
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "✅ Cache ya está actualizada",
+			"data": gin.H{
+				"version":     version,
+				"invalidated": false,
+			},
+		})
+	}
+}
+
 // NotifyListaPreciosUpdate notifica que se actualizó lista_precios_cantera masivamente
 // Este endpoint debe ser llamado desde el otro servidor después de actualizar ~9900 filas
 func (h *POSHandler) NotifyListaPreciosUpdate(c *gin.Context) {
@@ -579,6 +653,66 @@ func (h *POSHandler) validateGlobalVersion(ctx context.Context) error {
 	// Solo invalidar si la versión cambió
 	if currentVersion != newVersion {
 		_, err = h.productCache.InvalidateAllByVersion(ctx, newVersion)
+		return err
+	}
+
+	return nil
+}
+
+// validateProductosVersion valida la versión global de productos/packs
+// Optimizado: primero consulta Redis (ultra-rápido), solo consulta BD si es necesario
+func (h *POSHandler) validateProductosVersion(ctx context.Context) error {
+	// 1. Primero obtener versión actual de Redis (ultra-rápido, ~0.1ms)
+	currentVersion, err := h.productCache.GetProductosVersion(ctx)
+	if err != nil {
+		// Si hay error con Redis, no bloquear, continuar con cache
+		return err
+	}
+
+	// 2. Si no hay versión en Redis, obtener de BD y guardar (solo primera vez)
+	if currentVersion == "" {
+		timestamp, err := h.productRepo.GetLastProductosTimestamp(ctx)
+		if err != nil {
+			return err
+		}
+		if timestamp != nil {
+			version := timestamp.Format(time.RFC3339Nano)
+			return h.productCache.SetProductosVersion(ctx, version)
+		}
+		return nil
+	}
+
+	// 3. Si hay versión en Redis, verificar BD solo si pasó el intervalo
+	// Esto evita sobrecargar PostgreSQL con consultas en cada request
+	shouldCheck, err := h.productCache.ShouldCheckProductosDatabase(ctx)
+	if err != nil {
+		// Error verificando, continuar sin bloquear
+		return err
+	}
+
+	if !shouldCheck {
+		// Aún no es tiempo de verificar, solo usar Redis (ultra-rápido)
+		return nil
+	}
+
+	// Es tiempo de verificar BD (solo cada 10 segundos aproximadamente)
+	timestamp, err := h.productRepo.GetLastProductosTimestamp(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Actualizar timestamp de última verificación
+	h.productCache.UpdateProductosLastCheck(ctx)
+
+	if timestamp == nil {
+		return nil
+	}
+
+	newVersion := timestamp.Format(time.RFC3339Nano)
+
+	// Solo invalidar si la versión cambió
+	if currentVersion != newVersion {
+		_, err = h.productCache.InvalidateAllByProductosVersion(ctx, newVersion)
 		return err
 	}
 

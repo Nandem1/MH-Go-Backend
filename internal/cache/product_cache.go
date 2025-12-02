@@ -45,6 +45,10 @@ type ProductCache struct {
 	globalVersionKey        string
 	lastCheckTimestampKey   string
 	checkIntervalSeconds    int64 // Verificar BD solo cada N segundos
+	
+	// Versión global de productos (para invalidación masiva)
+	productosVersionKey     string
+	productosLastCheckKey   string
 }
 
 // NewProductCache crea una nueva instancia del caché
@@ -58,6 +62,8 @@ func NewProductCache(redisClient *redis.Client, maxL1Size int, ttl time.Duration
 		globalVersionKey:      "lista_precios:global_version",
 		lastCheckTimestampKey: "lista_precios:last_check",
 		checkIntervalSeconds:  10, // Verificar BD solo cada 10 segundos
+		productosVersionKey:   "productos:global_version",
+		productosLastCheckKey: "productos:last_check",
 	}
 
 	// Iniciar limpieza periódica del L1 cache
@@ -169,6 +175,87 @@ func (pc *ProductCache) ShouldCheckDatabase(ctx context.Context) (bool, error) {
 func (pc *ProductCache) UpdateLastCheck(ctx context.Context) error {
 	now := time.Now().Unix()
 	return pc.redisClient.Set(ctx, pc.lastCheckTimestampKey, now, 0).Err()
+}
+
+// GetProductosVersion obtiene la versión global de productos desde Redis
+func (pc *ProductCache) GetProductosVersion(ctx context.Context) (string, error) {
+	version, err := pc.redisClient.Get(ctx, pc.productosVersionKey).Result()
+	if err == redis.Nil {
+		return "", nil // No hay versión guardada aún
+	}
+	if err != nil {
+		return "", err
+	}
+	return version, nil
+}
+
+// SetProductosVersion actualiza la versión global de productos en Redis
+func (pc *ProductCache) SetProductosVersion(ctx context.Context, version string) error {
+	now := time.Now().Unix()
+	// Guardar versión y timestamp de última verificación
+	pipe := pc.redisClient.Pipeline()
+	pipe.Set(ctx, pc.productosVersionKey, version, 0)
+	pipe.Set(ctx, pc.productosLastCheckKey, now, 0)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// ShouldCheckProductosDatabase verifica si debemos consultar la BD para productos basado en el intervalo
+func (pc *ProductCache) ShouldCheckProductosDatabase(ctx context.Context) (bool, error) {
+	lastCheckStr, err := pc.redisClient.Get(ctx, pc.productosLastCheckKey).Result()
+	if err == redis.Nil {
+		// Nunca se ha verificado, sí debemos verificar
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	var lastCheck int64
+	if _, err := fmt.Sscanf(lastCheckStr, "%d", &lastCheck); err != nil {
+		// Error parseando, verificar de nuevo
+		return true, nil
+	}
+
+	now := time.Now().Unix()
+	elapsed := now - lastCheck
+
+	// Solo verificar si pasó el intervalo
+	return elapsed >= pc.checkIntervalSeconds, nil
+}
+
+// UpdateProductosLastCheck actualiza el timestamp de última verificación de productos
+func (pc *ProductCache) UpdateProductosLastCheck(ctx context.Context) error {
+	now := time.Now().Unix()
+	return pc.redisClient.Set(ctx, pc.productosLastCheckKey, now, 0).Err()
+}
+
+// InvalidateAllByProductosVersion invalida toda la cache si la versión de productos cambió
+func (pc *ProductCache) InvalidateAllByProductosVersion(ctx context.Context, newVersion string) (bool, error) {
+	currentVersion, err := pc.GetProductosVersion(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	// Si la versión cambió, invalidar todo
+	if currentVersion != newVersion {
+		pc.logger.Info("Versión global de productos cambió, invalidando cache",
+			zap.String("version_anterior", currentVersion),
+			zap.String("version_nueva", newVersion))
+
+		if err := pc.InvalidateAll(ctx); err != nil {
+			return false, err
+		}
+
+		// Actualizar la versión
+		if err := pc.SetProductosVersion(ctx, newVersion); err != nil {
+			return false, err
+		}
+
+		return true, nil
+	}
+
+	return false, nil
 }
 
 // InvalidateAllByVersion invalida toda la cache si la versión cambió

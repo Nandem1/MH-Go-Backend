@@ -17,6 +17,7 @@ type ProductRepository interface {
 	GetProductosFrecuentes(ctx context.Context, limit int) ([]*models.ProductoCompleto, error)
 	UpdateProducto(ctx context.Context, producto *models.ProductoCompleto) error
 	GetLastListaPreciosTimestamp(ctx context.Context) (*time.Time, error)
+	GetLastProductosTimestamp(ctx context.Context) (*time.Time, error)
 }
 
 // productRepository implementación del repository
@@ -212,12 +213,22 @@ func (r *productRepository) prepareStatements() error {
 		WHERE updated_at IS NOT NULL;
 	`
 
+	// Query para obtener el último timestamp de productos y packs (ultra-rápido)
+	// Obtiene el MAX entre productos y pack_listados
+	queryLastProductosTimestamp := `
+		SELECT GREATEST(
+			COALESCE((SELECT MAX(updated_at) FROM productos WHERE updated_at IS NOT NULL), '1970-01-01'::timestamp),
+			COALESCE((SELECT MAX(updated_at) FROM pack_listados WHERE updated_at IS NOT NULL), '1970-01-01'::timestamp)
+		) AS max_updated_at;
+	`
+
 	// Preparar statements
 	statements := map[string]string{
-		"get_producto_by_barcode":      queryProducto,
-		"get_pack_by_barcode":           queryPack,
-		"get_productos_frecuentes":     queryFrecuentes,
+		"get_producto_by_barcode":        queryProducto,
+		"get_pack_by_barcode":            queryPack,
+		"get_productos_frecuentes":        queryFrecuentes,
 		"get_last_lista_precios_timestamp": queryLastTimestamp,
+		"get_last_productos_timestamp":     queryLastProductosTimestamp,
 	}
 
 	for name, query := range statements {
@@ -301,6 +312,25 @@ func (r *productRepository) GetLastListaPreciosTimestamp(ctx context.Context) (*
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to get last lista precios timestamp: %w", err)
+	}
+
+	if !timestamp.Valid {
+		return nil, nil
+	}
+
+	return &timestamp.Time, nil
+}
+
+// GetLastProductosTimestamp obtiene el último timestamp de actualización de productos y packs
+// Esta query es ultra-rápida (solo MAX de índices)
+func (r *productRepository) GetLastProductosTimestamp(ctx context.Context) (*time.Time, error) {
+	var timestamp sql.NullTime
+	err := r.stmts["get_last_productos_timestamp"].QueryRowContext(ctx).Scan(&timestamp)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get last productos timestamp: %w", err)
 	}
 
 	if !timestamp.Valid {
